@@ -81,19 +81,25 @@ def should_include(app_type):
   .servers[] | 
   . as $server |
   {
-    "server_ip": .public_ip,
-    "apps": [
-      .apps[] |
-      select(should_include(.application)) |
-      {
-        "domain": (if .cname != "" then .cname else .app_fqdn end),
-        "database": .mysql_db_name,
-        "app_type": .application
-      }
-    ]
+    key: .public_ip,
+    value: {
+      "master_user": .master_user,
+      "ssh_command": "\(.master_user)@\(.public_ip)",
+      "apps": [
+        .apps[] |
+        select(should_include(.application)) |
+        {
+          "domain": (if .cname != "" then .cname else .app_fqdn end),
+          "database": .mysql_db_name,
+          "app_type": .application,
+          "webroot": "/home/master/applications/\(.mysql_db_name)/public_html/"
+        }
+      ]
+    }
   } |
-  select(.apps | length > 0)
-]')
+  select(.value.apps | length > 0)
+] | 
+from_entries')
 
 # Count filtered results
 APP_COUNT=$(echo "$RESULT" | jq '[.[].apps[]] | length')
