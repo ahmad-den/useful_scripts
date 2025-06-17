@@ -2,20 +2,25 @@
 set -e
 
 # =============================================================================
-# Cloudways Server Info Extractor with App Type Filtering
+# Cloudways Migration Script
 # Usage: bash script.sh [app_type|all]
-# Examples: 
-#   bash script.sh wordpress    # Shows wordpress + woocommerce
-#   bash script.sh phpstack     # Shows only phpstack
-#   bash script.sh all          # Shows all app types
+# Examples:
+#   bash script.sh wordpress    # WordPress + WooCommerce + WordPressMU
+#   bash script.sh phpstack     # PHPStack apps only
+#   bash script.sh all          # All app types (default)
+# 
+# Output:
+#   - cloudways_data_[type]_[timestamp].json    # Full database
+#   - all_domains_[timestamp].txt               # Clean domain list
 # =============================================================================
 
 # Get filter argument
 FILTER_TYPE="${1:-all}"
 
-# Convert to lowercase for comparison
+# Convert to lowercase
 FILTER_TYPE=$(echo "$FILTER_TYPE" | tr '[:upper:]' '[:lower:]')
 
+echo "Cloudways Migration Script"
 echo "Filter: $FILTER_TYPE"
 echo ""
 
@@ -64,13 +69,16 @@ if ! echo "$SERVERS_RESPONSE" | jq -e '.servers' &>/dev/null; then
   echo "Response: $SERVERS_RESPONSE"
   exit 1
 fi
-
 echo "✓ Data fetched successfully"
-echo ""
-echo "Processing server and application information..."
 
-# Extract and format the data - grouped by server IP with filtering
-RESULT=$(echo "$SERVERS_RESPONSE" | jq -r --arg filter "$FILTER_TYPE" '
+echo ""
+echo "Processing data..."
+
+# Generate timestamp for consistent file naming
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Create JSON database (domain-centric structure)
+JSON_DATA=$(echo "$SERVERS_RESPONSE" | jq -r --arg filter "$FILTER_TYPE" '
 def should_include(app_type):
   if $filter == "all" then true
   elif $filter == "wordpress" then (app_type | test("^(wordpress|woocommerce|wordpressmu)$"))
@@ -78,39 +86,42 @@ def should_include(app_type):
   end;
 
 [
-  .servers[] | 
+  .servers[] |
   . as $server |
+  .apps[] |
+  select(should_include(.application)) |
   {
-    key: .public_ip,
+    key: (if .cname != "" then .cname else .app_fqdn end),
     value: {
-      "master_user": .master_user,
-      "ssh_command": "\(.master_user)@\(.public_ip)",
-      "apps": [
-        .apps[] |
-        select(should_include(.application)) |
-        {
-          "domain": (if .cname != "" then .cname else .app_fqdn end),
-          "database": .mysql_db_name,
-          "app_type": .application,
-          "webroot": "/home/master/applications/\(.mysql_db_name)/public_html/"
-        }
-      ]
+      "ip": $server.public_ip,
+      "master_user": $server.master_user,
+      "ssh_command": "\($server.master_user)@\($server.public_ip)",
+      "database": .mysql_db_name,
+      "app_type": .application,
+      "webroot": "/home/master/applications/\(.mysql_db_name)/public_html/"
     }
-  } |
-  select(.value.apps | length > 0)
-] | 
+  }
+] |
 from_entries')
 
-# Count filtered results
-APP_COUNT=$(echo "$RESULT" | jq '[.[].apps[]] | length')
+# Create domains list
+DOMAINS_LIST=$(echo "$JSON_DATA" | jq -r 'keys[]' | sort)
 
-# Output clean JSON
-echo "$RESULT" | jq '.'
+# Count results
+APP_COUNT=$(echo "$JSON_DATA" | jq 'keys | length')
 
+# Save JSON database
+JSON_FILE="cloudways_data_${FILTER_TYPE}_${TIMESTAMP}.json"
+echo "$JSON_DATA" | jq '.' > "$JSON_FILE"
+
+# Save domains list
+DOMAINS_FILE="all_domains_${TIMESTAMP}.txt"
+echo "$DOMAINS_LIST" > "$DOMAINS_FILE"
+
+echo "✓ Processing complete"
 echo ""
 echo "Found $APP_COUNT apps matching filter: $FILTER_TYPE"
-
-# Save to file
-OUTPUT_FILE="cloudways_${FILTER_TYPE}_$(date +%Y%m%d_%H%M%S).json"
-echo "$RESULT" > "$OUTPUT_FILE"
-echo "✓ Data saved to: $OUTPUT_FILE"
+echo ""
+echo "Files created:"
+echo "📁 $JSON_FILE    # Full database"
+echo "📁 $DOMAINS_FILE           # Domain list"
