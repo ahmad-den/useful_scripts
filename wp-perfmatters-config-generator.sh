@@ -49,6 +49,19 @@ check_wp_cli() {
   log "WP-CLI: $(wp --version $WPARGS_COMMON 2>&1 | tr '\n' ' ')"
 }
 
+check_perfmatters() {
+  log "Checking Perfmatters plugin…"
+  if ! wp plugin is-installed perfmatters $WPARGS_COMMON >/dev/null 2>&1; then
+    error "Perfmatters plugin is not installed."
+    exit 1
+  fi
+  if ! wp plugin is-active perfmatters $WPARGS_COMMON >/dev/null 2>&1; then
+    error "Perfmatters plugin is installed but not active."
+    exit 1
+  fi
+  log "Perfmatters plugin is installed & active."
+}
+
 check_wordpress() {
   cd "$WORDPRESS_PATH" || { error "Cannot access: $WORDPRESS_PATH"; exit 1; }
   if ! wp core is-installed $WPARGS_COMMON >/dev/null 2>&1; then
@@ -232,6 +245,7 @@ main() {
 
   check_jq
   check_wp_cli
+  check_perfmatters
   check_wordpress
 
   if ! test_api; then
