@@ -88,6 +88,10 @@ done
 command -v curl >/dev/null 2>&1 || die "'curl' is required but not installed"
 command -v jq   >/dev/null 2>&1 || die "'jq' is required (apt install jq)"
 
+# --http1.1 was added in curl 7.33; detect support to stay compatible with older servers
+CURL_HTTP11=()
+curl --http1.1 --version >/dev/null 2>&1 && CURL_HTTP11=(--http1.1)
+
 ENDPOINT="${STATS_SERVER%/}/api/upload-batch"
 
 # ── Collect domain directories ────────────────────────────────────────────────
@@ -192,7 +196,7 @@ do_flush() {
   [[ -n "$REPORT_UUID" ]] && append_args+=(-F "appendUuid=${REPORT_UUID}")
 
   BATCH_RESPONSE=$(curl --silent --show-error --fail \
-    --http1.1 \
+    "${CURL_HTTP11[@]+"${CURL_HTTP11[@]}"}" \
     --max-time 600 \
     -H "Expect:" \
     "${HEADER_ARGS[@]+"${HEADER_ARGS[@]}"}" \
