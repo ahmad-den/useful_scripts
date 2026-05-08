@@ -94,6 +94,22 @@ curl --http1.1 --version >/dev/null 2>&1 && CURL_HTTP11=(--http1.1)
 
 ENDPOINT="${STATS_SERVER%/}/api/upload-batch"
 
+# ── Server-level disk stats (collected once, best-effort) ────────────────────
+SERVER_DISK_JSON='null'
+_df_lines=$(df -k 2>/dev/null | awk 'NR>1' || true)
+if [[ -n "$_df_lines" ]]; then
+  _df_json=$(echo "$_df_lines" | awk '
+    {
+      pct=$5; gsub(/%/,"",pct)
+      if ($1 ~ /^\/dev\// || $6 == "/") {
+        printf "{\"device\":\"%s\",\"totalKB\":%d,\"usedKB\":%d,\"availKB\":%d,\"usePct\":%d,\"mountpoint\":\"%s\"}\n",
+          $1, $2, $3, $4, pct, $6
+      }
+    }
+  ' 2>/dev/null || true)
+  [[ -n "$_df_json" ]] && SERVER_DISK_JSON=$(echo "$_df_json" | jq -s '.' 2>/dev/null) || true
+fi
+
 # ── Collect domain directories ────────────────────────────────────────────────
 declare -a DOMAINS=()
 
@@ -181,6 +197,12 @@ for domain in "${DOMAINS[@]}"; do
     uploads_human=$(du -sh "${public_dir}/wp-content/uploads" 2>/dev/null | awk '{print $1}' || true)
     plugins_human=$(du -sh "${public_dir}/wp-content/plugins" 2>/dev/null | awk '{print $1}' || true)
     themes_human=$(du -sh  "${public_dir}/wp-content/themes"  2>/dev/null | awk '{print $1}' || true)
+    uploads_kb=$(du -sk "${public_dir}/wp-content/uploads" 2>/dev/null | awk '{print $1}' || echo 0)
+    plugins_kb=$(du -sk "${public_dir}/wp-content/plugins" 2>/dev/null | awk '{print $1}' || echo 0)
+    themes_kb=$(du -sk  "${public_dir}/wp-content/themes"  2>/dev/null | awk '{print $1}' || echo 0)
+    [[ "$uploads_kb" =~ ^[0-9]+$ ]] || uploads_kb=0
+    [[ "$plugins_kb" =~ ^[0-9]+$ ]] || plugins_kb=0
+    [[ "$themes_kb"  =~ ^[0-9]+$ ]] || themes_kb=0
 
     db_size=""
     db_size_kb=0
@@ -199,23 +221,29 @@ for domain in "${DOMAINS[@]}"; do
     fi
 
     disk_json=$(jq -n \
-      --arg     pub      "$pub_human" \
-      --argjson pubBytes "$(( pub_kb * 1024 ))" \
-      --arg     db       "$db_size" \
-      --argjson dbBytes  "$(( db_size_kb * 1024 ))" \
-      --arg     uploads  "${uploads_human:-}" \
-      --arg     plugins  "${plugins_human:-}" \
-      --arg     themes   "${themes_human:-}" \
-      --arg     ts       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg     pub          "$pub_human" \
+      --argjson pubBytes     "$(( pub_kb * 1024 ))" \
+      --arg     db           "$db_size" \
+      --argjson dbBytes      "$(( db_size_kb * 1024 ))" \
+      --arg     uploads      "${uploads_human:-}" \
+      --argjson uploadsBytes "$(( uploads_kb * 1024 ))" \
+      --arg     plugins      "${plugins_human:-}" \
+      --argjson pluginsBytes "$(( plugins_kb * 1024 ))" \
+      --arg     themes       "${themes_human:-}" \
+      --argjson themesBytes  "$(( themes_kb * 1024 ))" \
+      --arg     ts           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       '{
         publicDirSize: $pub,
         publicDirBytes: $pubBytes,
-        dbSize:    (if $db      == "" then null else $db      end),
-        dbSizeBytes: $dbBytes,
-        uploads:   (if $uploads == "" then null else $uploads end),
-        plugins:   (if $plugins == "" then null else $plugins end),
-        themes:    (if $themes  == "" then null else $themes  end),
-        collectedAt: $ts
+        dbSize:       (if $db      == "" then null else $db      end),
+        dbSizeBytes:  $dbBytes,
+        uploads:      (if $uploads == "" then null else $uploads end),
+        uploadsBytes: $uploadsBytes,
+        plugins:      (if $plugins == "" then null else $plugins end),
+        pluginsBytes: $pluginsBytes,
+        themes:       (if $themes  == "" then null else $themes  end),
+        themesBytes:  $themesBytes,
+        collectedAt:  $ts
       }') 2>/dev/null || disk_json='null'
   fi
 
@@ -264,6 +292,7 @@ do_flush() {
     "${BASE_ARGS[@]+"${BASE_ARGS[@]}"}" \
     "${append_args[@]+"${append_args[@]}"}" \
     -F "diskStats=[$(IFS=','; echo "${batch_disk_parts[*]}")]" \
+    -F "serverDisk=${SERVER_DISK_JSON}" \
     "${batch_args[@]}" \
     "$ENDPOINT" 2>&1)
 
