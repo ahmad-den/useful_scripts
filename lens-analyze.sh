@@ -195,9 +195,6 @@ for domain in "${DOMAINS[@]}"; do
     pub_kb=$(du -sk "$public_dir" 2>/dev/null | awk '{print $1}' || echo 0)
     [[ "$pub_kb" =~ ^[0-9]+$ ]] || pub_kb=0
 
-    uploads_human=$(du -sh "${public_dir}/wp-content/uploads" 2>/dev/null | awk '{print $1}' || true)
-    plugins_human=$(du -sh "${public_dir}/wp-content/plugins" 2>/dev/null | awk '{print $1}' || true)
-    themes_human=$(du -sh  "${public_dir}/wp-content/themes"  2>/dev/null | awk '{print $1}' || true)
     uploads_kb=$(du -sk "${public_dir}/wp-content/uploads" 2>/dev/null | awk '{print $1}' || echo 0)
     plugins_kb=$(du -sk "${public_dir}/wp-content/plugins" 2>/dev/null | awk '{print $1}' || echo 0)
     themes_kb=$(du -sk  "${public_dir}/wp-content/themes"  2>/dev/null | awk '{print $1}' || echo 0)
@@ -224,14 +221,14 @@ for domain in "${DOMAINS[@]}"; do
     # ── ncdu full tree (uploaded as separate gz file for interactive UI) ─────
     _ncdu_gz=""
     if command -v ncdu >/dev/null 2>&1; then
-      _ncdu_json_tmp=$(mktemp /tmp/ncdu_XXXXXX.json)
-      _ncdu_gz_tmp=$(mktemp /tmp/ncdu_XXXXXX.json.gz)
+      _ncdu_json_tmp="${TMPDIR_UPLOAD}/${domain}.ncdu.json"
+      _ncdu_gz_tmp="${TMPDIR_UPLOAD}/${domain}.ncdu.json.gz"
       if timeout 180 ncdu -0 -o "$_ncdu_json_tmp" "$public_dir" 2>/dev/null \
-          && [[ -s "$_ncdu_json_tmp" ]]; then
-        gzip -c "$_ncdu_json_tmp" > "$_ncdu_gz_tmp" && _ncdu_gz="$_ncdu_gz_tmp"
+          && [[ -s "$_ncdu_json_tmp" ]] \
+          && gzip -c "$_ncdu_json_tmp" > "$_ncdu_gz_tmp"; then
+        _ncdu_gz="$_ncdu_gz_tmp"
       fi
-      rm -f "$_ncdu_json_tmp"
-      [[ -z "$_ncdu_gz" ]] && rm -f "$_ncdu_gz_tmp"
+      # temp files are cleaned up automatically on exit via TMPDIR_UPLOAD trap
     fi
 
     disk_json=$(jq -n \
@@ -239,25 +236,19 @@ for domain in "${DOMAINS[@]}"; do
       --argjson pubBytes     "$(( pub_kb * 1024 ))" \
       --arg     db           "$db_size" \
       --argjson dbBytes      "$(( db_size_kb * 1024 ))" \
-      --arg     uploads      "${uploads_human:-}" \
       --argjson uploadsBytes "$(( uploads_kb * 1024 ))" \
-      --arg     plugins      "${plugins_human:-}" \
       --argjson pluginsBytes "$(( plugins_kb * 1024 ))" \
-      --arg     themes       "${themes_human:-}" \
       --argjson themesBytes  "$(( themes_kb * 1024 ))" \
       --arg     ts           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       '{
-        publicDirSize: $pub,
+        publicDirSize:  $pub,
         publicDirBytes: $pubBytes,
-        dbSize:       (if $db      == "" then null else $db      end),
-        dbSizeBytes:  $dbBytes,
-        uploads:      (if $uploads == "" then null else $uploads end),
-        uploadsBytes: $uploadsBytes,
-        plugins:      (if $plugins == "" then null else $plugins end),
-        pluginsBytes: $pluginsBytes,
-        themes:       (if $themes  == "" then null else $themes  end),
-        themesBytes:  $themesBytes,
-        collectedAt:  $ts
+        dbSize:         (if $db == "" then null else $db end),
+        dbSizeBytes:    $dbBytes,
+        uploadsBytes:   $uploadsBytes,
+        pluginsBytes:   $pluginsBytes,
+        themesBytes:    $themesBytes,
+        collectedAt:    $ts
       }') 2>/dev/null || disk_json='null'
   fi
 
