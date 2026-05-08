@@ -1,100 +1,453 @@
-#!/usr/bin/env python3
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# checkmysite-upload.sh — Upload nginx access logs to lens.checkmysite.app
+#
+# Drop this script on any BigScoots client server and run it.
+# Looks for logs at: /home/nginx/domains/<domain>/log/access.log[.gz]
+# The server IP is detected automatically via 'hostname -I'.
+#
+# Usage:
+#   ./checkmysite-upload.sh
+#   ./checkmysite-upload.sh --only example.com
+#   ./checkmysite-upload.sh --path /custom/nginx/domains
+#
+# Options:
+#   --only <domain>    Upload a single domain instead of all.
+#   --path <dir>       Override base domains directory.
+#                      Default: /home/nginx/domains
+#   --log <filename>   Log filename inside each domain's log/ dir.
+#                      Default: access.log  (also tries access.log.gz)
+#   --token <token>    Auth token if your stats instance requires one.
+#   --open             Open the report URL in the browser after upload (macOS/Linux).
+#   -h / --help        Show this help and exit.
+# ─────────────────────────────────────────────────────────────────────────────
 
-import sys
-import json
+set -euo pipefail
 
-def sizeof_fmt(num, suffix='B'):
-    for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
-        if abs(num) < 1024.0:
-            return "%3.1f%s%s" % (num, unit, suffix)
-        num /= 1024.0
-    return "%.1f%s%s" % (num, 'Yi', suffix)
+# ── Temp directory (auto-cleaned on exit) ────────────────────────────────────
+TMPDIR_UPLOAD=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_UPLOAD"' EXIT
 
-def get_size(item):
-    return item.get("asize", item.get("dsize", 0))
+# ── Defaults ──────────────────────────────────────────────────────────────────
+STATS_SERVER="https://lens.checkmysite.app"
+PATH_BASE="/home/nginx/domains"
+LOG_SUBDIR="log"
+LOG_FILENAME="access.log"
+ONLY=""
+TOKEN=""
+OPEN_BROWSER=0
 
-def get_name(item):
-    if isinstance(item, dict):
-        return item.get("name", "<unknown>")
-    return item[0].get("name", "<unknown>")
+# Auto-detect this server's primary IP (skip loopback 127.x and 0.0.0.0)
+SERVER_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^127\.' | grep -v '^0\.0\.0\.0' | grep -v '^::1' | head -1 || true)
 
-def get_recursive(item):
-    if isinstance(item, dict):
-        return get_name(item), get_size(item)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+usage() {
+  grep '^#' "$0" | sed 's/^# \{0,2\}//' | sed 's/^#//'
+}
 
-    name = get_name(item)
-    size = get_size(item[0])
+info()  { printf '\033[1;32m[✔]\033[0m %s\n' "$*"; }
+warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
+skip()  { printf '\033[1;35m[~]\033[0m %s\n' "$*" >&2; }
+error() { printf '\033[1;31m[✘]\033[0m %s\n' "$*" >&2; }
+die()   { error "$*"; exit 1; }
 
-    for sub in item[1:]:
-        size += get_recursive(sub)[1]
+# Returns 0 (true) if the domain looks like a staging/dev/internal environment
+is_staging_domain() {
+  local d="$1"
+  # BigScoots staging/WPO/dev hostnames
+  [[ "$d" == *bigscoots-staging* ]] && return 0
+  [[ "$d" == *bigscoots-wpo*     ]] && return 0
+  [[ "$d" == *bigscoots-dev*     ]] && return 0
+  # Generic staging/dev/test subdomains or suffixes
+  [[ "$d" == staging.*   ]] && return 0
+  [[ "$d" == dev.*       ]] && return 0
+  [[ "$d" == test.*      ]] && return 0
+  [[ "$d" == *.staging   ]] && return 0
+  [[ "$d" == *.dev       ]] && return 0
+  [[ "$d" == *.test      ]] && return 0
+  [[ "$d" == *.local     ]] && return 0
+  return 1
+}
 
-    return name, size
+# ── Argument parsing ──────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --only)      ONLY="${2:?'--only requires a value'}";           shift 2 ;;
+    --path)      PATH_BASE="${2:?'--path requires a value'}";      shift 2 ;;
+    --log)       LOG_FILENAME="${2:?'--log requires a value'}";    shift 2 ;;
+    --token)     TOKEN="${2:?'--token requires a value'}";         shift 2 ;;
+    --open)      OPEN_BROWSER=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *) die "Unknown option: $1  (run with --help for usage)" ;;
+  esac
+done
 
-def find_path(root, path_parts):
-    current = root
+# ── Validation ────────────────────────────────────────────────────────────────
+[[ -d "$PATH_BASE" ]] || die "Domains directory not found: $PATH_BASE"
 
-    for part in path_parts:
-        if not isinstance(current, list):
-            return None
+command -v curl >/dev/null 2>&1 || die "'curl' is required but not installed"
+command -v jq   >/dev/null 2>&1 || die "'jq' is required (apt install jq)"
 
-        found = None
+# --http1.1 was added in curl 7.33; detect support to stay compatible with older servers
+CURL_HTTP11=()
+curl --http1.1 --version >/dev/null 2>&1 && CURL_HTTP11=(--http1.1)
 
-        for child in current[1:]:
-            if get_name(child) == part:
-                found = child
+ENDPOINT="${STATS_SERVER%/}/api/upload-batch"
+
+# ── Server-level disk stats (collected once, best-effort) ────────────────────
+SERVER_DISK_JSON='null'
+_df_lines=$(df -k 2>/dev/null | awk 'NR>1' || true)
+if [[ -n "$_df_lines" ]]; then
+  _df_json=$(echo "$_df_lines" | awk '
+    {
+      pct=$5; gsub(/%/,"",pct)
+      if ($1 ~ /^\/dev\// || $6 == "/") {
+        printf "{\"device\":\"%s\",\"totalKB\":%d,\"usedKB\":%d,\"availKB\":%d,\"usePct\":%d,\"mountpoint\":\"%s\"}\n",
+          $1, $2, $3, $4, pct, $6
+      }
+    }
+  ' 2>/dev/null || true)
+  [[ -n "$_df_json" ]] && SERVER_DISK_JSON=$(echo "$_df_json" | jq -s '.' 2>/dev/null) || true
+fi
+
+# ── Collect domain directories ────────────────────────────────────────────────
+declare -a DOMAINS=()
+
+if [[ -n "$ONLY" ]]; then
+  [[ -d "${PATH_BASE%/}/$ONLY" ]] || die "Domain directory not found: ${PATH_BASE%/}/$ONLY"
+  DOMAINS+=("$ONLY")
+else
+  while IFS= read -r -d '' dir; do
+    domain="$(basename "$dir")"
+    [[ "$domain" == .* ]] && continue
+    DOMAINS+=("$domain")
+  done < <(find "$PATH_BASE" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+fi
+
+[[ ${#DOMAINS[@]} -gt 0 ]] || die "No domain subdirectories found under $PATH_BASE"
+
+# ── Build upload file list ───────────────────────────────────────────────────
+declare -a HEADER_ARGS=()
+declare -a BASE_ARGS=()
+declare -a LOGFILES=()
+declare -a LOGNAMES=()
+declare -a FILESIZES=()
+declare -a DISKSTATS=()
+FOUND=0
+SKIPPED=0
+
+# Auth header (optional)
+[[ -n "$TOKEN" ]] && HEADER_ARGS+=(-H "Authorization: Bearer ${TOKEN}")
+
+# Server IP form field (optional)
+[[ -n "$SERVER_IP" ]] && BASE_ARGS+=(-F "serverIp=${SERVER_IP}")
+
+STAGING_SKIPPED=0
+
+for domain in "${DOMAINS[@]}"; do
+  # Skip staging / dev / internal environments before anything else
+  if is_staging_domain "$domain"; then
+    skip "Skipping staging/dev domain: ${domain}"
+    (( STAGING_SKIPPED++ )) || true
+    continue
+  fi
+
+  log_dir="${PATH_BASE%/}/${domain}/${LOG_SUBDIR}"
+
+  if   [[ -f "${log_dir}/${LOG_FILENAME}" ]]; then
+    logfile="${log_dir}/${LOG_FILENAME}"
+  elif [[ -f "${log_dir}/${LOG_FILENAME}.gz" ]]; then
+    logfile="${log_dir}/${LOG_FILENAME}.gz"
+  else
+    warn "No log found for ${domain}  (looked in ${log_dir}/${LOG_FILENAME}[.gz]) — skipping"
+    (( SKIPPED++ )) || true
+    continue
+  fi
+
+  # Skip empty log files (would cause a 422 from the server)
+  raw_size=$(stat -c%s "$logfile" 2>/dev/null || stat -f%z "$logfile" 2>/dev/null || echo 0)
+  if [[ "$raw_size" -eq 0 ]]; then
+    skip "Empty log file for ${domain} — skipping"
+    (( SKIPPED++ )) || true
+    continue
+  fi
+
+  size_human=$(du -sh "$logfile" 2>/dev/null | cut -f1)
+
+  # Compress to tmp if not already gzipped (reduces 34MB → ~3MB, solves Cloudflare 100MB limit)
+  if [[ "$logfile" == *.gz ]]; then
+    upload_file="$logfile"
+  else
+    upload_file="${TMPDIR_UPLOAD}/${domain}.gz"
+    gzip -c "$logfile" > "$upload_file"
+  fi
+  upload_size=$(stat -c%s "$upload_file" 2>/dev/null || stat -f%z "$upload_file" 2>/dev/null || echo 0)
+  upload_size_human=$(du -sh "$upload_file" 2>/dev/null | cut -f1)
+
+  info "Queuing  ${domain}  (${size_human:-?} → ${upload_size_human:-?} compressed)"
+
+  # ── Collect disk stats (best-effort, non-blocking) ─────────────────────────
+  disk_json='null'
+  public_dir="${PATH_BASE%/}/${domain}/public"
+  if [[ -d "$public_dir" ]]; then
+    pub_human=$(du -sh "$public_dir" 2>/dev/null | awk '{print $1}' || echo "?")
+    pub_kb=$(du -sk "$public_dir" 2>/dev/null | awk '{print $1}' || echo 0)
+    [[ "$pub_kb" =~ ^[0-9]+$ ]] || pub_kb=0
+
+    uploads_human=$(du -sh "${public_dir}/wp-content/uploads" 2>/dev/null | awk '{print $1}' || true)
+    plugins_human=$(du -sh "${public_dir}/wp-content/plugins" 2>/dev/null | awk '{print $1}' || true)
+    themes_human=$(du -sh  "${public_dir}/wp-content/themes"  2>/dev/null | awk '{print $1}' || true)
+    uploads_kb=$(du -sk "${public_dir}/wp-content/uploads" 2>/dev/null | awk '{print $1}' || echo 0)
+    plugins_kb=$(du -sk "${public_dir}/wp-content/plugins" 2>/dev/null | awk '{print $1}' || echo 0)
+    themes_kb=$(du -sk  "${public_dir}/wp-content/themes"  2>/dev/null | awk '{print $1}' || echo 0)
+    [[ "$uploads_kb" =~ ^[0-9]+$ ]] || uploads_kb=0
+    [[ "$plugins_kb" =~ ^[0-9]+$ ]] || plugins_kb=0
+    [[ "$themes_kb"  =~ ^[0-9]+$ ]] || themes_kb=0
+
+    db_size=""
+    db_size_kb=0
+    if command -v wp >/dev/null 2>&1 && [[ -f "${public_dir}/wp-config.php" ]]; then
+      _raw=$(wp --path="$public_dir" --allow-root db query \
+        "SELECT ROUND(SUM(data_length + index_length) / 1024, 0) FROM information_schema.tables WHERE table_schema = DATABASE();" \
+        --skip-column-names 2>/dev/null | tr -d '[:space:]' || true)
+      [[ "$_raw" =~ ^[0-9]+$ ]] && db_size_kb=$_raw
+      if [[ "$db_size_kb" -gt 0 ]]; then
+        db_size=$(awk -v kb="$db_size_kb" 'BEGIN {
+          if      (kb >= 1048576) printf "%.1fGiB", kb/1048576
+          else if (kb >= 1024)   printf "%.1fMiB", kb/1024
+          else                   printf "%dKiB",   kb
+        }')
+      fi
+    fi
+
+    # ── Top items by disk usage (for drill-down UI) ──────────────────────────
+    # Tries ncdu first (full recursive tree, accurate), falls back to du -d 4
+    top_items_json='[]'
+    if command -v python3 >/dev/null 2>&1; then
+      if command -v ncdu >/dev/null 2>&1; then
+        _ncdu_tmp=$(mktemp /tmp/ncdu_XXXXXX.json)
+        if timeout 120 ncdu -0 -o "$_ncdu_tmp" "$public_dir" 2>/dev/null && [[ -s "$_ncdu_tmp" ]]; then
+          # Pass ncdu file as argv[2] so heredoc stdin is not conflicted
+          top_items_json=$(python3 - "$public_dir" "$_ncdu_tmp" <<'PYEOF'
+import json, sys
+
+def flatten(node, path='', out=None):
+    if out is None: out = []
+    if isinstance(node, list) and node:
+        info = node[0]
+        name = info.get('name', '')
+        size = info.get('dsize', 0)
+        full = (path.rstrip('/') + '/' + name) if name else path
+        out.append({'path': full, 'bytes': size, 'isDir': True})
+        for child in node[1:]:
+            flatten(child, full, out)
+    elif isinstance(node, dict):
+        name = node.get('name', '')
+        size = node.get('dsize', 0)
+        out.append({'path': path.rstrip('/') + '/' + name, 'bytes': size, 'isDir': False})
+    return out
+
+try:
+    with open(sys.argv[2]) as f:
+        data = json.load(f)
+    root = data[3]
+    base = sys.argv[1].rstrip('/')
+    items = flatten(root, '')
+    rel = []
+    for i in items:
+        p = i['path']
+        if p == base or p == base.split('/')[-1]:
+            continue
+        for prefix in (base + '/', '/' + base.split('/')[-1] + '/'):
+            if p.startswith(prefix):
+                p = p[len(prefix):]
                 break
+        if p.startswith('/'):
+            p = p.lstrip('/')
+        rel.append({'path': p, 'bytes': i['bytes'], 'isDir': i['isDir']})
+    rel.sort(key=lambda x: -x['bytes'])
+    print(json.dumps(rel[:25]))
+except Exception:
+    print('[]')
+PYEOF
+          ) || top_items_json='[]'
+        fi
+        rm -f "$_ncdu_tmp"
+      else
+        # Fallback: du depth-4; write output to temp file to avoid stdin conflict
+        _du_tmp=$(mktemp /tmp/du_XXXXXX.txt)
+        du -d 4 -k "$public_dir" 2>/dev/null | sort -rn | head -40 > "$_du_tmp" || true
+        top_items_json=$(python3 - "$public_dir" "$_du_tmp" <<'PYEOF'
+import sys, json
+base = sys.argv[1].rstrip('/')
+items = []
+with open(sys.argv[2]) as f:
+    for line in f:
+        line = line.rstrip('\n')
+        parts = line.split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit(): continue
+        kb, path = parts[0], parts[1]
+        if path == base: continue
+        rel = path[len(base):].lstrip('/') if path.startswith(base + '/') else path
+        if rel: items.append({'path': rel, 'bytes': int(kb)*1024, 'isDir': True})
+items.sort(key=lambda x: -x['bytes'])
+print(json.dumps(items[:25]))
+PYEOF
+        ) || top_items_json='[]'
+        rm -f "$_du_tmp"
+      fi
+    fi
 
-        if found is None:
-            return None
+    disk_json=$(jq -n \
+      --arg     pub          "$pub_human" \
+      --argjson pubBytes     "$(( pub_kb * 1024 ))" \
+      --arg     db           "$db_size" \
+      --argjson dbBytes      "$(( db_size_kb * 1024 ))" \
+      --arg     uploads      "${uploads_human:-}" \
+      --argjson uploadsBytes "$(( uploads_kb * 1024 ))" \
+      --arg     plugins      "${plugins_human:-}" \
+      --argjson pluginsBytes "$(( plugins_kb * 1024 ))" \
+      --arg     themes       "${themes_human:-}" \
+      --argjson themesBytes  "$(( themes_kb * 1024 ))" \
+      --arg     ts           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --argjson topItems     "$top_items_json" \
+      '{
+        publicDirSize: $pub,
+        publicDirBytes: $pubBytes,
+        dbSize:       (if $db      == "" then null else $db      end),
+        dbSizeBytes:  $dbBytes,
+        uploads:      (if $uploads == "" then null else $uploads end),
+        uploadsBytes: $uploadsBytes,
+        plugins:      (if $plugins == "" then null else $plugins end),
+        pluginsBytes: $pluginsBytes,
+        themes:       (if $themes  == "" then null else $themes  end),
+        themesBytes:  $themesBytes,
+        collectedAt:  $ts,
+        topItems:     (if ($topItems | length) > 0 then $topItems else null end)
+      }') 2>/dev/null || disk_json='null'
+  fi
 
-        current = found
+  LOGFILES+=("$upload_file")
+  LOGNAMES+=("$domain")
+  FILESIZES+=("$upload_size")
+  DISKSTATS+=("$disk_json")
+  (( FOUND++ )) || true
+done
 
-    return current
+(( FOUND > 0 )) || die "No log files found for any domain under $PATH_BASE"
 
-data = json.loads(sys.stdin.read())
+# ── Upload (size-based batching: ≤70 MB and ≤8 files per request) ─────────────
+# 70 MB keeps each request safely under Cloudflare's 100 MB free-plan limit.
+echo
+printf '\033[1;37mUploading %d log file(s) to %s …\033[0m\n' "$FOUND" "$ENDPOINT"
+[[ -n "$SERVER_IP" ]] && printf '\033[1;37mServer IP: %s (auto-detected)\033[0m\n' "$SERVER_IP"
+echo
 
-root = data[3]
+SIZE_LIMIT=$(( 70 * 1024 * 1024 ))   # 70 MB per batch
+FILE_LIMIT=8                          # also cap at 8 files per batch
 
-target_path = sys.argv[1] if len(sys.argv) > 1 else ""
-path_parts = [p for p in target_path.strip("/").split("/") if p]
+declare -a ALL_RESPONSES=()
+declare -a batch_args=()
+declare -a batch_disk_parts=()
+BATCH_NUM=0
+batch_size=0
+batch_count=0
+REPORT_UUID=""   # set after first batch; subsequent batches append to same report
 
-target = find_path(root, path_parts)
+do_flush() {
+  [[ ${#batch_args[@]} -eq 0 ]] && return
+  (( BATCH_NUM++ )) || true
+  printf '\033[1;37mBatch %d: uploading %d file(s)…\033[0m\n' "$BATCH_NUM" "$batch_count"
 
-if target is None:
-    print(f"Path not found: {target_path}")
-    sys.exit(1)
+  # Build append-uuid arg if this is not the first batch
+  local -a append_args=()
+  [[ -n "$REPORT_UUID" ]] && append_args+=(-F "appendUuid=${REPORT_UUID}")
 
-if isinstance(target, dict):
-    name, size = get_recursive(target)
-    print(f"{sizeof_fmt(size)} {name}")
-    sys.exit(0)
+  BATCH_RESPONSE=$(curl --silent --show-error \
+    "${CURL_HTTP11[@]+"${CURL_HTTP11[@]}"}" \
+    --max-time 600 \
+    --write-out '\nHTTP_STATUS:%{http_code}' \
+    -H "Expect:" \
+    "${HEADER_ARGS[@]+"${HEADER_ARGS[@]}"}" \
+    "${BASE_ARGS[@]+"${BASE_ARGS[@]}"}" \
+    "${append_args[@]+"${append_args[@]}"}" \
+    -F "diskStats=[$(IFS=','; echo "${batch_disk_parts[*]}")]" \
+    -F "serverDisk=${SERVER_DISK_JSON}" \
+    "${batch_args[@]}" \
+    "$ENDPOINT" 2>&1)
 
-items = [get_recursive(child) for child in target[1:]]
+  HTTP_STATUS=$(echo "$BATCH_RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+  BATCH_RESPONSE=$(echo "$BATCH_RESPONSE" | grep -v 'HTTP_STATUS:')
 
-sum_sizes = sum(size for _, size in items)
+  if [[ "${HTTP_STATUS:-0}" -ge 400 ]]; then
+    SERVER_MSG=$(echo "$BATCH_RESPONSE" | jq -r '.error // .message // empty' 2>/dev/null || true)
+    if [[ -n "$SERVER_MSG" ]]; then
+      error "Batch ${BATCH_NUM} failed (HTTP ${HTTP_STATUS}): ${SERVER_MSG}"
+    else
+      error "Batch ${BATCH_NUM} failed (HTTP ${HTTP_STATUS}): ${BATCH_RESPONSE}"
+    fi
+    exit 1
+  fi
 
-if not items or sum_sizes == 0:
-    print("No size data found.")
-    sys.exit(0)
+  # Capture uuid from first batch response; subsequent batches reuse it
+  if [[ -z "$REPORT_UUID" ]]; then
+    REPORT_UUID=$(echo "$BATCH_RESPONSE" | jq -r '.uuid // empty')
+  fi
 
-biggest = max(size for _, size in items)
-target_name = get_name(target)
+  ALL_RESPONSES+=("$BATCH_RESPONSE")
+  batch_args=()
+  batch_disk_parts=()
+  batch_size=0
+  batch_count=0
+}
 
-display_path = target_path if target_path else target_name
+for idx in "${!LOGFILES[@]}"; do
+  fpath="${LOGFILES[$idx]}"
+  fname="${LOGNAMES[$idx]}"
+  fsize="${FILESIZES[$idx]}"
+  # Flush current batch if adding this file would exceed size or count limits
+  if (( batch_count >= FILE_LIMIT || ( batch_count > 0 && batch_size + fsize > SIZE_LIMIT ) )); then
+    do_flush
+  fi
+  batch_args+=(-F "files=@${fpath};filename=${fname}")
+  batch_disk_parts+=("{\"domain\":$(printf '%s' "${fname}" | jq -Rs .),\"stats\":${DISKSTATS[$idx]}}")
+  (( batch_size  += fsize )) || true
+  (( batch_count += 1     )) || true
+done
+do_flush
 
-print("------ {} --- {} -------".format(display_path, sizeof_fmt(sum_sizes)))
+# ── Parse and output JSON ─────────────────────────────────────────────────────
+# All batches share the same report UUID — output is always a single object.
+RESPONSE="${ALL_RESPONSES[0]}"
+if ! echo "$RESPONSE" | jq -e '.reportUrl' >/dev/null 2>&1; then
+  printf '{"success":false,"error":"Unexpected server response","raw":"%s"}\n' \
+    "$(echo "$RESPONSE" | tr '"' "'" | head -c 200)"
+  exit 1
+fi
+REPORT_URL=$(echo "$RESPONSE" | jq -r '.reportUrl')
 
-for name, size in sorted(items, key=lambda x: x[1], reverse=True):
-    hsize = sizeof_fmt(size)
-    percent = size / sum_sizes * 100
-    percent_str = "({:.1f}%)".format(percent)
+# Count total domains across all batches
+TOTAL_PROCESSED=0
+ALL_DOMAINS='[]'
+for r in "${ALL_RESPONSES[@]}"; do
+  TOTAL_PROCESSED=$(( TOTAL_PROCESSED + $(echo "$r" | jq '.domainsProcessed') ))
+  ALL_DOMAINS=$(echo "$ALL_DOMAINS" | jq --argjson d "$(echo "$r" | jq '[.domains[]|{domain,requests}]')" '. + $d')
+done
 
-    bar_len = round(size / biggest * 10) if biggest else 0
+jq -n \
+  --arg url "$REPORT_URL" \
+  --argjson processed "$TOTAL_PROCESSED" \
+  --arg skipped "$SKIPPED" \
+  --arg staging "$STAGING_SKIPPED" \
+  --argjson domains "$ALL_DOMAINS" \
+  '{success:true, reportUrl:$url, domainsProcessed:$processed,
+    skippedNoLog:($skipped|tonumber), skippedStagingDev:($staging|tonumber),
+    domains:$domains}'
 
-    print("{} {:8} [{}{}] {}".format(
-        " " * max(0, 10 - len(str(hsize))) + str(hsize),
-        " " * max(0, 8 - len(percent_str)) + percent_str,
-        "#" * bar_len,
-        "-" * (10 - bar_len),
-        name
-    ))
+# ── Open browser (optional) ───────────────────────────────────────────────────
+if [[ "$OPEN_BROWSER" -eq 1 ]]; then
+  if   command -v xdg-open >/dev/null 2>&1; then xdg-open "$REPORT_URL"
+  elif command -v open     >/dev/null 2>&1; then open     "$REPORT_URL"
+  else warn "Could not open browser (tried xdg-open / open)"
+  fi
+fi
