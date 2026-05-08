@@ -147,6 +147,14 @@ for domain in "${DOMAINS[@]}"; do
     continue
   fi
 
+  # Skip empty log files (would cause a 422 from the server)
+  raw_size=$(stat -c%s "$logfile" 2>/dev/null || stat -f%z "$logfile" 2>/dev/null || echo 0)
+  if [[ "$raw_size" -eq 0 ]]; then
+    skip "Empty log file for ${domain} — skipping"
+    (( SKIPPED++ )) || true
+    continue
+  fi
+
   size_human=$(du -sh "$logfile" 2>/dev/null | cut -f1)
 
   # Compress to tmp if not already gzipped (reduces 34MB → ~3MB, solves Cloudflare 100MB limit)
@@ -195,18 +203,29 @@ do_flush() {
   local -a append_args=()
   [[ -n "$REPORT_UUID" ]] && append_args+=(-F "appendUuid=${REPORT_UUID}")
 
-  BATCH_RESPONSE=$(curl --silent --show-error --fail \
+  BATCH_RESPONSE=$(curl --silent --show-error \
     "${CURL_HTTP11[@]+"${CURL_HTTP11[@]}"}" \
     --max-time 600 \
+    --write-out '\nHTTP_STATUS:%{http_code}' \
     -H "Expect:" \
     "${HEADER_ARGS[@]+"${HEADER_ARGS[@]}"}" \
     "${BASE_ARGS[@]+"${BASE_ARGS[@]}"}" \
     "${append_args[@]+"${append_args[@]}"}" \
     "${batch_args[@]}" \
-    "$ENDPOINT" 2>&1) || {
-      printf '{"success":false,"error":"%s"}\n' "$(echo "$BATCH_RESPONSE" | tr '"' "'")"
-      exit 1
-    }
+    "$ENDPOINT" 2>&1)
+
+  HTTP_STATUS=$(echo "$BATCH_RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+  BATCH_RESPONSE=$(echo "$BATCH_RESPONSE" | grep -v 'HTTP_STATUS:')
+
+  if [[ "${HTTP_STATUS:-0}" -ge 400 ]]; then
+    SERVER_MSG=$(echo "$BATCH_RESPONSE" | jq -r '.error // .message // empty' 2>/dev/null || true)
+    if [[ -n "$SERVER_MSG" ]]; then
+      error "Batch ${BATCH_NUM} failed (HTTP ${HTTP_STATUS}): ${SERVER_MSG}"
+    else
+      error "Batch ${BATCH_NUM} failed (HTTP ${HTTP_STATUS}): ${BATCH_RESPONSE}"
+    fi
+    exit 1
+  fi
 
   # Capture uuid from first batch response; subsequent batches reuse it
   if [[ -z "$REPORT_UUID" ]]; then
