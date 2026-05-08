@@ -220,6 +220,81 @@ for domain in "${DOMAINS[@]}"; do
       fi
     fi
 
+    # ── Top items by disk usage (for drill-down UI) ──────────────────────────
+    # Tries ncdu first (full recursive tree, accurate), falls back to du -d 4
+    top_items_json='[]'
+    if command -v python3 >/dev/null 2>&1; then
+      if command -v ncdu >/dev/null 2>&1; then
+        _ncdu_tmp=$(mktemp /tmp/ncdu_XXXXXX.json)
+        if timeout 120 ncdu -0 -o "$_ncdu_tmp" "$public_dir" 2>/dev/null && [[ -s "$_ncdu_tmp" ]]; then
+          top_items_json=$(python3 - "$public_dir" <<'PYEOF' < "$_ncdu_tmp"
+import json, sys
+
+def flatten(node, path='', out=None):
+    if out is None: out = []
+    if isinstance(node, list) and node:
+        info = node[0]
+        name = info.get('name', '')
+        size = info.get('dsize', 0)
+        full = (path.rstrip('/') + '/' + name) if name else path
+        out.append({'path': full, 'bytes': size, 'isDir': True})
+        for child in node[1:]:
+            flatten(child, full, out)
+    elif isinstance(node, dict):
+        name = node.get('name', '')
+        size = node.get('dsize', 0)
+        out.append({'path': path.rstrip('/') + '/' + name, 'bytes': size, 'isDir': False})
+    return out
+
+try:
+    data = json.load(sys.stdin)
+    root = data[3]
+    base = sys.argv[1].rstrip('/')
+    items = flatten(root, '')
+    # Strip absolute base path prefix so paths are relative
+    rel = []
+    for i in items:
+        p = i['path']
+        if p == base or p == base.split('/')[-1]:
+            continue  # skip root entry itself
+        # Try to make relative to base
+        for prefix in (base + '/', '/' + base.split('/')[-1] + '/'):
+            if p.startswith(prefix):
+                p = p[len(prefix):]
+                break
+        if p.startswith('/'):
+            p = p.lstrip('/')
+        rel.append({'path': p, 'bytes': i['bytes'], 'isDir': i['isDir']})
+    rel.sort(key=lambda x: -x['bytes'])
+    print(json.dumps(rel[:25]))
+except Exception as e:
+    print('[]')
+PYEOF
+          ) || top_items_json='[]'
+        fi
+        rm -f "$_ncdu_tmp"
+      else
+        # Fallback: du depth-4 (fast, 4 levels deep, good for WP structure)
+        top_items_json=$(du -d 4 -k "$public_dir" 2>/dev/null | sort -rn | head -40 | \
+          python3 - "$public_dir" <<'PYEOF'
+import sys, json
+base = sys.argv[1].rstrip('/')
+items = []
+for line in sys.stdin:
+    line = line.rstrip('\n')
+    parts = line.split(None, 1)
+    if len(parts) < 2 or not parts[0].isdigit(): continue
+    kb, path = parts[0], parts[1]
+    if path == base: continue
+    rel = path[len(base):].lstrip('/') if path.startswith(base + '/') else path
+    if rel: items.append({'path': rel, 'bytes': int(kb)*1024, 'isDir': True})
+items.sort(key=lambda x: -x['bytes'])
+print(json.dumps(items[:25]))
+PYEOF
+        ) || top_items_json='[]'
+      fi
+    fi
+
     disk_json=$(jq -n \
       --arg     pub          "$pub_human" \
       --argjson pubBytes     "$(( pub_kb * 1024 ))" \
@@ -232,6 +307,7 @@ for domain in "${DOMAINS[@]}"; do
       --arg     themes       "${themes_human:-}" \
       --argjson themesBytes  "$(( themes_kb * 1024 ))" \
       --arg     ts           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --argjson topItems     "$top_items_json" \
       '{
         publicDirSize: $pub,
         publicDirBytes: $pubBytes,
@@ -243,7 +319,8 @@ for domain in "${DOMAINS[@]}"; do
         pluginsBytes: $pluginsBytes,
         themes:       (if $themes  == "" then null else $themes  end),
         themesBytes:  $themesBytes,
-        collectedAt:  $ts
+        collectedAt:  $ts,
+        topItems:     (if ($topItems | length) > 0 then $topItems else null end)
       }') 2>/dev/null || disk_json='null'
   fi
 
