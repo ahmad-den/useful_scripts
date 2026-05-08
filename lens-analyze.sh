@@ -133,6 +133,7 @@ declare -a LOGFILES=()
 declare -a LOGNAMES=()
 declare -a FILESIZES=()
 declare -a DISKSTATS=()
+declare -a NCDU_GZ_FILES=()   # parallel to LOGNAMES; "" if no ncdu for that domain
 FOUND=0
 SKIPPED=0
 
@@ -220,82 +221,17 @@ for domain in "${DOMAINS[@]}"; do
       fi
     fi
 
-    # ── Top items by disk usage (for drill-down UI) ──────────────────────────
-    # Tries ncdu first (full recursive tree, accurate), falls back to du -d 4
-    top_items_json='[]'
-    if command -v python3 >/dev/null 2>&1; then
-      if command -v ncdu >/dev/null 2>&1; then
-        _ncdu_tmp=$(mktemp /tmp/ncdu_XXXXXX.json)
-        if timeout 120 ncdu -0 -o "$_ncdu_tmp" "$public_dir" 2>/dev/null && [[ -s "$_ncdu_tmp" ]]; then
-          # Pass ncdu file as argv[2] so heredoc stdin is not conflicted
-          top_items_json=$(python3 - "$public_dir" "$_ncdu_tmp" <<'PYEOF'
-import json, sys
-
-def flatten(node, path='', out=None):
-    if out is None: out = []
-    if isinstance(node, list) and node:
-        info = node[0]
-        name = info.get('name', '')
-        size = info.get('dsize', 0)
-        full = (path.rstrip('/') + '/' + name) if name else path
-        out.append({'path': full, 'bytes': size, 'isDir': True})
-        for child in node[1:]:
-            flatten(child, full, out)
-    elif isinstance(node, dict):
-        name = node.get('name', '')
-        size = node.get('dsize', 0)
-        out.append({'path': path.rstrip('/') + '/' + name, 'bytes': size, 'isDir': False})
-    return out
-
-try:
-    with open(sys.argv[2]) as f:
-        data = json.load(f)
-    root = data[3]
-    base = sys.argv[1].rstrip('/')
-    items = flatten(root, '')
-    rel = []
-    for i in items:
-        p = i['path']
-        if p == base or p == base.split('/')[-1]:
-            continue
-        for prefix in (base + '/', '/' + base.split('/')[-1] + '/'):
-            if p.startswith(prefix):
-                p = p[len(prefix):]
-                break
-        if p.startswith('/'):
-            p = p.lstrip('/')
-        rel.append({'path': p, 'bytes': i['bytes'], 'isDir': i['isDir']})
-    rel.sort(key=lambda x: -x['bytes'])
-    print(json.dumps(rel[:25]))
-except Exception:
-    print('[]')
-PYEOF
-          ) || top_items_json='[]'
-        fi
-        rm -f "$_ncdu_tmp"
-      else
-        # Fallback: du depth-4; write output to temp file to avoid stdin conflict
-        _du_tmp=$(mktemp /tmp/du_XXXXXX.txt)
-        du -d 4 -k "$public_dir" 2>/dev/null | sort -rn | head -40 > "$_du_tmp" || true
-        top_items_json=$(python3 - "$public_dir" "$_du_tmp" <<'PYEOF'
-import sys, json
-base = sys.argv[1].rstrip('/')
-items = []
-with open(sys.argv[2]) as f:
-    for line in f:
-        line = line.rstrip('\n')
-        parts = line.split(None, 1)
-        if len(parts) < 2 or not parts[0].isdigit(): continue
-        kb, path = parts[0], parts[1]
-        if path == base: continue
-        rel = path[len(base):].lstrip('/') if path.startswith(base + '/') else path
-        if rel: items.append({'path': rel, 'bytes': int(kb)*1024, 'isDir': True})
-items.sort(key=lambda x: -x['bytes'])
-print(json.dumps(items[:25]))
-PYEOF
-        ) || top_items_json='[]'
-        rm -f "$_du_tmp"
+    # ── ncdu full tree (uploaded as separate gz file for interactive UI) ─────
+    _ncdu_gz=""
+    if command -v ncdu >/dev/null 2>&1; then
+      _ncdu_json_tmp=$(mktemp /tmp/ncdu_XXXXXX.json)
+      _ncdu_gz_tmp=$(mktemp /tmp/ncdu_XXXXXX.json.gz)
+      if timeout 180 ncdu -0 -o "$_ncdu_json_tmp" "$public_dir" 2>/dev/null \
+          && [[ -s "$_ncdu_json_tmp" ]]; then
+        gzip -c "$_ncdu_json_tmp" > "$_ncdu_gz_tmp" && _ncdu_gz="$_ncdu_gz_tmp"
       fi
+      rm -f "$_ncdu_json_tmp"
+      [[ -z "$_ncdu_gz" ]] && rm -f "$_ncdu_gz_tmp"
     fi
 
     disk_json=$(jq -n \
@@ -310,7 +246,6 @@ PYEOF
       --arg     themes       "${themes_human:-}" \
       --argjson themesBytes  "$(( themes_kb * 1024 ))" \
       --arg     ts           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      --argjson topItems     "$top_items_json" \
       '{
         publicDirSize: $pub,
         publicDirBytes: $pubBytes,
@@ -322,8 +257,7 @@ PYEOF
         pluginsBytes: $pluginsBytes,
         themes:       (if $themes  == "" then null else $themes  end),
         themesBytes:  $themesBytes,
-        collectedAt:  $ts,
-        topItems:     (if ($topItems | length) > 0 then $topItems else null end)
+        collectedAt:  $ts
       }') 2>/dev/null || disk_json='null'
   fi
 
@@ -331,6 +265,7 @@ PYEOF
   LOGNAMES+=("$domain")
   FILESIZES+=("$upload_size")
   DISKSTATS+=("$disk_json")
+  NCDU_GZ_FILES+=("${_ncdu_gz:-}")
   (( FOUND++ )) || true
 done
 
@@ -349,6 +284,7 @@ FILE_LIMIT=8                          # also cap at 8 files per batch
 declare -a ALL_RESPONSES=()
 declare -a batch_args=()
 declare -a batch_disk_parts=()
+declare -a batch_ncdu_args=()
 BATCH_NUM=0
 batch_size=0
 batch_count=0
@@ -373,6 +309,7 @@ do_flush() {
     "${append_args[@]+"${append_args[@]}"}" \
     -F "diskStats=[$(IFS=','; echo "${batch_disk_parts[*]}")]" \
     -F "serverDisk=${SERVER_DISK_JSON}" \
+    "${batch_ncdu_args[@]+"${batch_ncdu_args[@]}"}" \
     "${batch_args[@]}" \
     "$ENDPOINT" 2>&1)
 
@@ -397,6 +334,7 @@ do_flush() {
   ALL_RESPONSES+=("$BATCH_RESPONSE")
   batch_args=()
   batch_disk_parts=()
+  batch_ncdu_args=()
   batch_size=0
   batch_count=0
 }
@@ -405,12 +343,15 @@ for idx in "${!LOGFILES[@]}"; do
   fpath="${LOGFILES[$idx]}"
   fname="${LOGNAMES[$idx]}"
   fsize="${FILESIZES[$idx]}"
+  fncdu="${NCDU_GZ_FILES[$idx]:-}"
   # Flush current batch if adding this file would exceed size or count limits
   if (( batch_count >= FILE_LIMIT || ( batch_count > 0 && batch_size + fsize > SIZE_LIMIT ) )); then
     do_flush
   fi
   batch_args+=(-F "files=@${fpath};filename=${fname}")
   batch_disk_parts+=("{\"domain\":$(printf '%s' "${fname}" | jq -Rs .),\"stats\":${DISKSTATS[$idx]}}")
+  # Attach ncdu gz as a separate file with special filename prefix
+  [[ -n "$fncdu" && -f "$fncdu" ]] && batch_ncdu_args+=(-F "files=@${fncdu};filename=__ncdu__${fname}")
   (( batch_size  += fsize )) || true
   (( batch_count += 1     )) || true
 done
